@@ -376,6 +376,54 @@ pub(crate) fn catalog_path() -> PathBuf {
         .join("endpoints.json")
 }
 
+/// One file per saved machine; its content changes whenever a retry is requested.
+fn retry_request_dir() -> PathBuf {
+    crate::config::state_dir()
+        .join("client")
+        .join("retry-requests")
+}
+
+/// Ask open clients to retry a machine now instead of waiting out their reconnect backoff,
+/// e.g. after `herdr machine reconnect` verified it from this host.
+pub(crate) fn request_endpoint_retry(id: &ProfileId) -> io::Result<()> {
+    request_endpoint_retry_in(&retry_request_dir(), id)
+}
+
+fn request_endpoint_retry_in(dir: &Path, id: &ProfileId) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::fs::write(dir.join(id.as_str()), format!("{token}\n"))
+}
+
+/// Pending retry requests by machine. Clients compare successive reads, so only a changed
+/// token counts as a new request.
+pub(crate) fn load_endpoint_retry_requests() -> std::collections::HashMap<ProfileId, String> {
+    load_endpoint_retry_requests_in(&retry_request_dir())
+}
+
+fn load_endpoint_retry_requests_in(dir: &Path) -> std::collections::HashMap<ProfileId, String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .take(MAX_PROFILES)
+        .filter_map(|entry| {
+            let id = ProfileId::parse(entry.file_name().to_str()?).ok()?;
+            let mut token = String::new();
+            std::fs::File::open(entry.path())
+                .ok()?
+                .take(64)
+                .read_to_string(&mut token)
+                .ok()?;
+            Some((id, token))
+        })
+        .collect()
+}
+
 fn selection_path() -> PathBuf {
     crate::config::state_dir()
         .join("client")
@@ -385,6 +433,22 @@ fn selection_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_requests_change_token_per_request_and_skip_foreign_files() {
+        let dir = std::env::temp_dir().join(format!("herdr-endpoint-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_endpoint_retry_requests_in(&dir).is_empty());
+        let id = ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        request_endpoint_retry_in(&dir, &id).unwrap();
+        std::fs::write(dir.join("not-a-profile"), "1").unwrap();
+        let first = load_endpoint_retry_requests_in(&dir);
+        assert_eq!(first.keys().collect::<Vec<_>>(), vec![&id]);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        request_endpoint_retry_in(&dir, &id).unwrap();
+        assert_ne!(load_endpoint_retry_requests_in(&dir)[&id], first[&id]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn path(name: &str) -> PathBuf {
         std::env::temp_dir()

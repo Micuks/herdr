@@ -848,6 +848,11 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
+            ClientLoopEvent::EndpointRetry(id) => {
+                if supervisors.retry_now(&endpoint::ClientEndpointId::Ssh(id.clone()), now) {
+                    tracing::info!(endpoint = %id, "retrying endpoint on request");
+                }
+            }
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
                 let image_bridge_active = endpoint_accepts_local_images(
