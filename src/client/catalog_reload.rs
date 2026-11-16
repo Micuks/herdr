@@ -7,6 +7,8 @@ pub(super) fn watch_profiles(
     // One bounded read per second per client, independent of rendering and pane count.
     std::thread::spawn(move || {
         let mut previous = None;
+        // Requests made before this client started were for an earlier client.
+        let mut retry_requests = endpoint::load_endpoint_retry_requests();
         while !should_quit.load(Ordering::Acquire) {
             let current = endpoint::EndpointCatalog::load_profiles();
             if previous.as_ref() != Some(&current) {
@@ -18,6 +20,17 @@ pub(super) fn watch_profiles(
                     break;
                 }
             }
+            let requests = endpoint::load_endpoint_retry_requests();
+            for (id, token) in &requests {
+                if retry_requests.get(id) != Some(token)
+                    && event_tx
+                        .blocking_send(ClientLoopEvent::EndpointRetry(id.clone()))
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            retry_requests = requests;
             std::thread::sleep(Duration::from_secs(1));
         }
     });

@@ -242,6 +242,24 @@ impl EndpointSupervisors {
         true
     }
 
+    /// The machine was just verified reachable from outside this client: attempt now rather
+    /// than at the end of the backoff. The attempt count is kept, so a failure still backs off.
+    pub(crate) fn retry_now(&mut self, endpoint_id: &ClientEndpointId, now: Instant) -> bool {
+        let Some(state) = self.endpoints.get_mut(endpoint_id) else {
+            return false;
+        };
+        if state.in_flight || state.online_since.is_some() {
+            return false;
+        }
+        match state.next_attempt {
+            Some(deadline) if deadline > now => {
+                state.next_attempt = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn disconnected(
         &mut self,
         endpoint_id: &ClientEndpointId,
@@ -455,6 +473,38 @@ mod tests {
         );
         assert_eq!(supervisors.endpoints[&id].generation, None);
         assert_eq!(supervisors.endpoints[&other_id].generation, Some(3));
+    }
+
+    #[test]
+    fn retry_now_skips_the_backoff_but_keeps_counting_failures() {
+        let now = Instant::now();
+        let profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[profile], now);
+        supervisors.endpoints.get_mut(&id).unwrap().generation = Some(2);
+        for attempt in 1..=8 {
+            assert!(supervisors.record_status(&id, 2, ClientEndpointStatus::Reconnecting, now));
+            assert_eq!(supervisors.endpoints[&id].attempts, attempt);
+        }
+        assert_eq!(
+            supervisors.endpoints[&id].next_attempt,
+            Some(now + retry_delay(8))
+        );
+        let later = now + Duration::from_secs(3);
+        assert!(supervisors.retry_now(&id, later));
+        assert_eq!(supervisors.endpoints[&id].next_attempt, Some(later));
+        assert_eq!(supervisors.endpoints[&id].attempts, 8);
+        assert!(!supervisors.retry_now(&id, later), "already due");
+
+        // In flight or online: nothing to hurry.
+        supervisors.endpoints.get_mut(&id).unwrap().in_flight = true;
+        supervisors.endpoints.get_mut(&id).unwrap().next_attempt =
+            Some(later + Duration::from_secs(9));
+        assert!(!supervisors.retry_now(&id, later));
+        supervisors.endpoints.get_mut(&id).unwrap().in_flight = false;
+        assert!(supervisors.record_status(&id, 2, ClientEndpointStatus::Online, later));
+        assert!(!supervisors.retry_now(&id, later));
+        assert!(!supervisors.retry_now(&ClientEndpointId::Local, later));
     }
 
     #[test]
